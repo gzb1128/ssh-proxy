@@ -1,0 +1,22 @@
+# 远端服务器配置
+remote_server:
+  host: "your-server-ip"  # 远端服务器IP，所有服务都监听在这个IP上
+  ssh_name: "your-ssh-user"     # SSH连接名称，用于ssh命令
+
+# 服务定义
+services:
+  example-service:
+    remote_port: 8080
+    local_port: 8080  # 可选，默认使用remote_port
+
+  another-service:
+    remote_port: 3000
+    # local_port未指定，将使用3000
+
+  database:
+    remote_port: 3306
+    local_port: 13306  # 本地使用不同端口避免冲突
+
+# 可选配置项
+options:
+  startup_delay: 0.5  # 启动每个代理之间的延迟（秒）
