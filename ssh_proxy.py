@@ -13,6 +13,13 @@ import time
 from pathlib import Path
 
 import yaml
+from jinja2 import Environment, BaseLoader, StrictUndefined
+
+# 默认端口号
+DEFAULT_REMOTE_PORT = 80
+
+# 模板标记，用于检测是否需要渲染
+TEMPLATE_MARKERS = ('{{', '}}')
 
 
 class SSHProxyManager:
@@ -24,6 +31,43 @@ class SSHProxyManager:
         self.config = None
         self.processes = {}  # service_name -> subprocess.Popen
         self.shutdown_requested = False
+        self.force_exit = False  # 第二次信号时强制退出
+        # 创建 Jinja2 Environment 一次，复用
+        self._jinja_env = Environment(loader=BaseLoader(), undefined=StrictUndefined)
+
+    def _render_template(self, value, env_vars):
+        """渲染 Jinja2 模板，支持变量引用"""
+        if not isinstance(value, str):
+            return value
+
+        # 快速检查：如果字符串不包含模板标记，直接返回
+        if TEMPLATE_MARKERS[0] not in value or TEMPLATE_MARKERS[1] not in value:
+            return value
+
+        try:
+            template = self._jinja_env.from_string(value)
+            return template.render(env=env_vars)
+        except Exception as e:
+            print(f"警告: 模板渲染失败 '{value}': {e}")
+            return value
+
+    def _render_config_templates(self, config):
+        """递归渲染配置中的所有模板"""
+        # 使用 get 提取 env 变量定义，不破坏原始配置
+        env_vars = config.get('env', {})
+        return self._render_value(config, env_vars)
+
+    def _render_value(self, value, env_vars):
+        """递归渲染单个值"""
+        if isinstance(value, dict):
+            # 跳过 'env' 键，它不需要渲染
+            return {k: self._render_value(v, env_vars) for k, v in value.items() if k != 'env'}
+        elif isinstance(value, list):
+            return [self._render_value(item, env_vars) for item in value]
+        elif isinstance(value, str):
+            return self._render_template(value, env_vars)
+        else:
+            return value
 
     def load_config(self):
         """加载配置文件"""
@@ -34,6 +78,9 @@ class SSHProxyManager:
 
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
+
+        # 渲染配置中的模板
+        self.config = self._render_config_templates(self.config)
 
         # 验证配置
         if 'remote_server' not in self.config:
@@ -54,14 +101,20 @@ class SSHProxyManager:
         services_to_proxy = all_services - self.exclude_services
         return services_to_proxy
 
+    def _get_service_connection_info(self, service_config):
+        """获取服务的连接信息，统一处理默认值逻辑"""
+        remote_server = self.config['remote_server']
+        remote_host = service_config.get('host', remote_server['host'])
+        remote_port = service_config.get('remote_port', DEFAULT_REMOTE_PORT)
+        local_port = service_config.get('local_port', remote_port)
+        return remote_host, remote_port, local_port
+
     def build_ssh_command(self, service_name, service_config):
         """构造SSH命令"""
         remote_server = self.config['remote_server']
-        remote_host = remote_server['host']
         ssh_name = remote_server['ssh_name']
 
-        remote_port = service_config['remote_port']
-        local_port = service_config.get('local_port', remote_port)
+        remote_host, remote_port, local_port = self._get_service_connection_info(service_config)
 
         cmd = ['ssh', '-N', '-L', f'{local_port}:{remote_host}:{remote_port}', ssh_name]
         return cmd, local_port
@@ -69,8 +122,6 @@ class SSHProxyManager:
     def start_proxy(self, service_name, service_config):
         """启动单个代理"""
         cmd, local_port = self.build_ssh_command(service_name, service_config)
-        remote_host = self.config['remote_server']['host']
-        remote_port = service_config['remote_port']
 
         try:
             # stdout/stderr直接继承到终端
@@ -95,11 +146,9 @@ class SSHProxyManager:
         print(f"[ssh-proxy] 将代理 {len(services_to_proxy)} 个服务\n")
 
         # 先显示将要启动的服务
-        remote_host = self.config['remote_server']['host']
         for service_name in sorted(services_to_proxy):
             service_config = self.config['services'][service_name]
-            remote_port = service_config['remote_port']
-            local_port = service_config.get('local_port', remote_port)
+            remote_host, remote_port, local_port = self._get_service_connection_info(service_config)
             print(f"[{service_name}] → localhost:{local_port} -> {remote_host}:{remote_port}")
 
         print()
@@ -171,6 +220,9 @@ class SSHProxyManager:
         except KeyboardInterrupt:
             pass
         finally:
+            if self.force_exit:
+                print("\n[ssh-proxy] 强制退出！")
+                sys.exit(1)
             print("\n[ssh-proxy] 正在停止所有代理...")
             self.stop_all_proxies()
 
@@ -181,13 +233,28 @@ class SSHProxyManager:
         self.wait_for_shutdown()
 
 
+# 全局变量，用于信号处理
+_manager = None
+
+
 def signal_handler(signum, frame):
     """信号处理器"""
-    print(f"\n[ssh-proxy] 收到信号 {signum}")
-    # 这里我们只是设置标志，实际的清理在wait_for_shutdown中处理
+    global _manager
+    if _manager is None:
+        return
+
+    if _manager.shutdown_requested:
+        # 第二次信号，强制退出
+        _manager.force_exit = True
+        _manager.shutdown_requested = True
+    else:
+        # 第一次信号，体面终止
+        print(f"\n[ssh-proxy] 收到信号 {signum}，正在停止... (再次发送信号将强制退出)")
+        _manager.shutdown_requested = True
 
 
 def main():
+    global _manager
     parser = argparse.ArgumentParser(
         description='SSH代理管理脚本 - 将远端服务代理到本地',
         formatter_class=argparse.RawDescriptionHelpFormatter
@@ -212,8 +279,8 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # 创建并运行管理器
-    manager = SSHProxyManager(args.config, args.exclude)
-    manager.run()
+    _manager = SSHProxyManager(args.config, args.exclude)
+    _manager.run()
 
 
 if __name__ == '__main__':

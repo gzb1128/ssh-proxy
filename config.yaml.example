@@ -3,6 +3,13 @@ remote_server:
   host: "your-server-ip"  # 远端服务器IP，所有服务都监听在这个IP上
   ssh_name: "your-ssh-user"     # SSH连接名称，用于ssh命令
 
+# 环境变量定义（可选）
+# 可在配置中使用 {{ env.VAR_NAME }} 引用
+env:
+  MY_SERVER_IP: "192.168.1.100"
+  DB_HOST: "10.0.0.5"
+  DOMAIN_BACK: stack-beijing.local
+
 # 服务定义
 services:
   example-service:
@@ -16,6 +23,20 @@ services:
   database:
     remote_port: 3306
     local_port: 13306  # 本地使用不同端口避免冲突
+
+  # 使用自定义 host，覆盖 remote_server.host
+  custom-host-service:
+    remote_port: 9000
+    host: "custom.server.ip"  # 可选，指定后会忽略 remote_server.host
+
+  # 使用配置文件中定义的环境变量
+  env-example-service:
+    remote_port: 8080
+    host: "{{ env.MY_SERVER_IP }}"  # 引用 env 中定义的变量
+
+  # 仅配置 host，remote_port 默认为 80
+  host-only-service:
+    host: "jdock-zeus.{{ env.DOMAIN_BACK }}"
 
 # 可选配置项
 options:
