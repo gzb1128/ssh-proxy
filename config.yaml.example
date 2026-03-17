@@ -10,6 +10,11 @@ env:
   DB_HOST: "10.0.0.5"
   DOMAIN_BACK: stack-beijing.local
 
+# 说明：
+# 默认使用 HTTP 代理模式，会自动将请求的 Host 头设置为远端服务器的域名
+# 这样可以直接用 localhost:local_port 访问，无需修改 /etc/hosts
+# 如果需要直接 SSH 隧道模式（不修改 Host 头），使用 --no-http-proxy 参数启动
+
 # 服务定义
 services:
   example-service:

@@ -7,10 +7,15 @@ SSH代理管理脚本
 import argparse
 import os
 import signal
+import socket
+import socketserver
 import subprocess
 import sys
+import threading
 import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import urlparse
 
 import yaml
 from jinja2 import Environment, BaseLoader, StrictUndefined
@@ -22,14 +27,184 @@ DEFAULT_REMOTE_PORT = 80
 TEMPLATE_MARKERS = ('{{', '}}')
 
 
+class ProxyHTTPHandler(BaseHTTPRequestHandler):
+    """HTTP代理处理器，自动设置正确的Host头"""
+
+    # 类变量，用于存储代理配置
+    remote_host = None
+    backend_port = None
+
+    def log_message(self, format, *args):
+        """静默日志，不输出到stderr"""
+        pass
+
+    def do_CONNECT(self):
+        """处理HTTPS CONNECT请求"""
+        self.send_error(405, "Method Not Allowed")
+
+    def do_GET(self):
+        self._handle_request()
+
+    def do_POST(self):
+        self._handle_request()
+
+    def do_PUT(self):
+        self._handle_request()
+
+    def do_DELETE(self):
+        self._handle_request()
+
+    def do_PATCH(self):
+        self._handle_request()
+
+    def do_HEAD(self):
+        self._handle_request()
+
+    def do_OPTIONS(self):
+        self._handle_request()
+
+    def _handle_request(self):
+        """处理所有HTTP请求"""
+        try:
+            # 读取请求体
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length) if content_length > 0 else None
+
+            # 连接后端（SSH隧道）
+            backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            backend_socket.settimeout(30)
+            backend_socket.connect(('127.0.0.1', self.backend_port))
+
+            # 构建转发请求，使用正确的Host头
+            request_line = f"{self.command} {self.path} HTTP/1.1\r\n"
+
+            # 构建请求头，确保Host是远端服务器的域名
+            headers = []
+            for key, value in self.headers.items():
+                if key.lower() == 'host':
+                    # 替换为远端服务器的Host
+                    headers.append(f"Host: {self.remote_host}\r\n")
+                else:
+                    headers.append(f"{key}: {value}\r\n")
+
+            # 如果没有Host头，添加一个
+            if not any(k.lower() == 'host' for k in self.headers.keys()):
+                headers.append(f"Host: {self.remote_host}\r\n")
+
+            # 发送请求
+            request_data = request_line + ''.join(headers) + "\r\n"
+            backend_socket.sendall(request_data.encode('utf-8'))
+
+            if body:
+                backend_socket.sendall(body)
+
+            # 读取响应并转发
+            response = b''
+            while True:
+                try:
+                    chunk = backend_socket.recv(8192)
+                    if not chunk:
+                        break
+                    response += chunk
+                    # 尝试解析响应头，判断是否结束
+                    if b'\r\n\r\n' in response:
+                        # 检查Content-Length
+                        header_end = response.index(b'\r\n\r\n')
+                        header_part = response[:header_end].decode('utf-8', errors='ignore')
+
+                        # 对于chunked编码或无Content-Length的响应，持续读取直到连接关闭
+                        if 'Transfer-Encoding: chunked' in header_part:
+                            # 继续读取直到收到0\r\n\r\n
+                            while True:
+                                chunk = backend_socket.recv(8192)
+                                if not chunk:
+                                    break
+                                response += chunk
+                                if b'\r\n0\r\n\r\n' in response:
+                                    break
+                            break
+                        elif 'Content-Length:' in header_part:
+                            # 解析Content-Length
+                            for line in header_part.split('\r\n'):
+                                if line.lower().startswith('content-length:'):
+                                    content_length = int(line.split(':')[1].strip())
+                                    body_start = header_end + 4
+                                    while len(response) < body_start + content_length:
+                                        chunk = backend_socket.recv(8192)
+                                        if not chunk:
+                                            break
+                                        response += chunk
+                                    break
+                            break
+                        else:
+                            # 无Content-Length，读取到连接关闭
+                            while True:
+                                chunk = backend_socket.recv(8192)
+                                if not chunk:
+                                    break
+                                response += chunk
+                            break
+                except socket.timeout:
+                    break
+
+            backend_socket.close()
+
+            # 发送响应给客户端
+            self.connection.sendall(response)
+
+        except Exception as e:
+            print(f"  ✗ 代理请求失败: {e}")
+            self.send_error(502, f"Bad Gateway: {e}")
+
+    def handle_one_request(self):
+        """重写以处理连接关闭的情况"""
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if len(self.raw_requestline) > 65536:
+                self.requestline = ''
+                self.request_version = ''
+                self.command = ''
+                self.send_error(414)
+                return
+            if not self.raw_requestline:
+                self.close_connection = 1
+                return
+            if not self.parse_request():
+                return
+            mname = 'do_' + self.command
+            if not hasattr(self, mname):
+                self.send_error(501, "Unsupported method")
+                return
+            method = getattr(self, mname)
+            method()
+            self.wfile.flush()
+        except socket.timeout:
+            self.close_connection = 1
+            return
+        except ConnectionResetError:
+            self.close_connection = 1
+            return
+        except BrokenPipeError:
+            self.close_connection = 1
+            return
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """多线程HTTP服务器"""
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 class SSHProxyManager:
     """SSH代理管理器"""
 
-    def __init__(self, config_path, exclude_services):
+    def __init__(self, config_path, exclude_services, use_http_proxy=True):
         self.config_path = config_path
         self.exclude_services = set(exclude_services)
+        self.use_http_proxy = use_http_proxy
         self.config = None
         self.processes = {}  # service_name -> subprocess.Popen
+        self.http_servers = {}  # service_name -> HTTPServer
         self.shutdown_requested = False
         self.force_exit = False  # 第二次信号时强制退出
         # 创建 Jinja2 Environment 一次，复用
@@ -109,38 +284,86 @@ class SSHProxyManager:
         local_port = service_config.get('local_port', remote_port)
         return remote_host, remote_port, local_port
 
-    def build_ssh_command(self, service_name, service_config):
+    def _find_available_port(self, start_port=20000, max_attempts=100):
+        """查找可用端口"""
+        for port in range(start_port, start_port + max_attempts):
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(('', port))
+                    return port
+            except OSError:
+                continue
+        raise RuntimeError("无法找到可用端口")
+
+    def build_ssh_command(self, service_name, service_config, ssh_tunnel_port):
         """构造SSH命令"""
         remote_server = self.config['remote_server']
         ssh_name = remote_server['ssh_name']
 
-        remote_host, remote_port, local_port = self._get_service_connection_info(service_config)
+        remote_host, remote_port, _ = self._get_service_connection_info(service_config)
 
-        cmd = ['ssh', '-N', '-L', f'{local_port}:{remote_host}:{remote_port}', ssh_name]
-        return cmd, local_port
+        cmd = ['ssh', '-N', '-L', f'{ssh_tunnel_port}:{remote_host}:{remote_port}', ssh_name]
+        return cmd, ssh_tunnel_port
 
     def start_proxy(self, service_name, service_config):
-        """启动单个代理"""
-        cmd, local_port = self.build_ssh_command(service_name, service_config)
+        """启动单个代理（SSH隧道 + 可选的HTTP代理）"""
+        remote_host, remote_port, local_port = self._get_service_connection_info(service_config)
 
-        try:
-            # stdout/stderr直接继承到终端
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            return process
-        except Exception as e:
-            print(f"✗ 启动失败: {service_name} - {e}")
-            return None
+        if self.use_http_proxy:
+            # 模式：本地HTTP代理 -> SSH隧道(随机端口) -> 远端
+            # SSH隧道使用随机端口
+            ssh_tunnel_port = self._find_available_port()
+            cmd, _ = self.build_ssh_command(service_name, service_config, ssh_tunnel_port)
+
+            try:
+                # 启动SSH隧道
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+                # 等待SSH隧道建立
+                time.sleep(0.2)
+
+                # 创建HTTP代理，转发到SSH隧道
+                handler = type('ProxyHandler', (ProxyHTTPHandler,), {
+                    'remote_host': remote_host,
+                    'backend_port': ssh_tunnel_port
+                })
+                server = ThreadedHTTPServer(('127.0.0.1', local_port), handler)
+                server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                server_thread.start()
+
+                return process, server
+            except Exception as e:
+                print(f"✗ 启动失败: {service_name} - {e}")
+                return None, None
+        else:
+            # 传统模式：直接SSH隧道
+            remote_server = self.config['remote_server']
+            ssh_name = remote_server['ssh_name']
+            cmd = ['ssh', '-N', '-L', f'{local_port}:{remote_host}:{remote_port}', ssh_name]
+
+            try:
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                return process, None
+            except Exception as e:
+                print(f"✗ 启动失败: {service_name} - {e}")
+                return None, None
 
     def start_all_proxies(self):
         """启动所有代理"""
         services_to_proxy = self.get_services_to_proxy()
 
-        print("[ssh-proxy] 正在启动代理...")
+        mode_str = "HTTP代理模式" if self.use_http_proxy else "直接隧道模式"
+        print(f"[ssh-proxy] 正在启动代理 ({mode_str})...")
         if self.exclude_services:
             print(f"[ssh-proxy] 排除的服务: {', '.join(sorted(self.exclude_services))}")
         print(f"[ssh-proxy] 将代理 {len(services_to_proxy)} 个服务\n")
@@ -161,7 +384,7 @@ class SSHProxyManager:
                 break
 
             service_config = self.config['services'][service_name]
-            process = self.start_proxy(service_name, service_config)
+            process, http_server = self.start_proxy(service_name, service_config)
 
             if process is None:
                 print(f"✗ 启动失败: {service_name}")
@@ -169,6 +392,8 @@ class SSHProxyManager:
                 sys.exit(1)
 
             self.processes[service_name] = process
+            if http_server:
+                self.http_servers[service_name] = http_server
 
             # 短暂延迟
             time.sleep(startup_delay)
@@ -190,6 +415,16 @@ class SSHProxyManager:
 
     def stop_all_proxies(self):
         """停止所有代理"""
+        # 先停止HTTP服务器
+        for service_name, server in self.http_servers.items():
+            try:
+                server.shutdown()
+                print(f"✓ 已停止HTTP代理: {service_name}")
+            except Exception as e:
+                print(f"✗ 停止HTTP代理失败: {service_name} - {e}")
+        self.http_servers.clear()
+
+        # 再停止SSH进程
         for service_name, process in self.processes.items():
             if process.poll() is None:  # 进程仍在运行
                 process.terminate()
@@ -198,7 +433,8 @@ class SSHProxyManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-                print(f"✓ 已停止: {service_name}")
+                print(f"✓ 已停止SSH隧道: {service_name}")
+        self.processes.clear()
 
     def wait_for_shutdown(self):
         """等待 shutdown 信号"""
@@ -271,6 +507,11 @@ def main():
         metavar='SERVICE',
         help='要排除的服务名称（将代理除这些服务外的所有服务）'
     )
+    parser.add_argument(
+        '--no-http-proxy',
+        action='store_true',
+        help='禁用HTTP代理模式，使用直接SSH隧道（Host头不会被修改）'
+    )
 
     args = parser.parse_args()
 
@@ -279,7 +520,8 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     # 创建并运行管理器
-    _manager = SSHProxyManager(args.config, args.exclude)
+    use_http_proxy = not args.no_http_proxy
+    _manager = SSHProxyManager(args.config, args.exclude, use_http_proxy)
     _manager.run()
 
 
