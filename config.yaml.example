@@ -1,48 +1,49 @@
-# 远端服务器配置
+# Remote server configuration
 remote_server:
-  host: "your-server-ip"  # 远端服务器IP，所有服务都监听在这个IP上
-  ssh_name: "your-ssh-user"     # SSH连接名称，用于ssh命令
+  host: "your-server-ip"      # Remote server IP, all services listen on this IP
+  ssh_name: "your-ssh-user"   # SSH connection name for ssh command
 
-# 环境变量定义（可选）
-# 可在配置中使用 {{ env.VAR_NAME }} 引用
+# Environment variables (optional)
+# Use {{ env.VAR_NAME }} to reference in config
 env:
   MY_SERVER_IP: "192.168.1.100"
   DB_HOST: "10.0.0.5"
-  DOMAIN_BACK: stack-beijing.local
+  DOMAIN_SUFFIX: example.local
 
-# 说明：
-# 默认使用 HTTP 代理模式，会自动将请求的 Host 头设置为远端服务器的域名
-# 这样可以直接用 localhost:local_port 访问，无需修改 /etc/hosts
-# 如果需要直接 SSH 隧道模式（不修改 Host 头），使用 --no-http-proxy 参数启动
+# Note:
+# By default, HTTP proxy mode is enabled, which automatically sets the Host header
+# to the remote server's domain. This allows direct access via localhost:local_port
+# without modifying /etc/hosts.
+# Use --no-http-proxy flag to disable HTTP proxy mode and use direct SSH tunnel.
 
-# 服务定义
+# Service definitions
 services:
   example-service:
     remote_port: 8080
-    local_port: 8080  # 可选，默认使用remote_port
+    local_port: 8080          # Optional, defaults to remote_port
 
   another-service:
     remote_port: 3000
-    # local_port未指定，将使用3000
+    # local_port not specified, will use 3000
 
   database:
     remote_port: 3306
-    local_port: 13306  # 本地使用不同端口避免冲突
+    local_port: 13306         # Use different local port to avoid conflicts
 
-  # 使用自定义 host，覆盖 remote_server.host
+  # Custom host, overrides remote_server.host
   custom-host-service:
     remote_port: 9000
-    host: "custom.server.ip"  # 可选，指定后会忽略 remote_server.host
+    host: "custom.server.ip"  # Optional, will ignore remote_server.host
 
-  # 使用配置文件中定义的环境变量
+  # Use environment variables defined in env section
   env-example-service:
     remote_port: 8080
-    host: "{{ env.MY_SERVER_IP }}"  # 引用 env 中定义的变量
+    host: "{{ env.MY_SERVER_IP }}"  # Reference env variable
 
-  # 仅配置 host，remote_port 默认为 80
+  # Host only, remote_port defaults to 80
   host-only-service:
-    host: "jdock-zeus.{{ env.DOMAIN_BACK }}"
+    host: "server.{{ env.DOMAIN_SUFFIX }}"
 
-# 可选配置项
+# Optional settings
 options:
-  startup_delay: 0.5  # 启动每个代理之间的延迟（秒）
+  startup_delay: 0.5          # Delay between starting each proxy (seconds)

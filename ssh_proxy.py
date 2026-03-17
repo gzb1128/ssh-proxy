@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-SSH代理管理脚本
-将远端VPC中的服务通过跳板机代理到本地
+SSH Proxy Manager
+Proxy remote VPC services to local machine through a bastion host
 """
 
 import argparse
@@ -20,26 +20,26 @@ from urllib.parse import urlparse
 import yaml
 from jinja2 import Environment, BaseLoader, StrictUndefined
 
-# 默认端口号
+# Default port
 DEFAULT_REMOTE_PORT = 80
 
-# 模板标记，用于检测是否需要渲染
+# Template markers for detecting if rendering is needed
 TEMPLATE_MARKERS = ('{{', '}}')
 
 
 class ProxyHTTPHandler(BaseHTTPRequestHandler):
-    """HTTP代理处理器，自动设置正确的Host头"""
+    """HTTP proxy handler that automatically sets correct Host header"""
 
-    # 类变量，用于存储代理配置
+    # Class variables for proxy configuration
     remote_host = None
     backend_port = None
 
     def log_message(self, format, *args):
-        """静默日志，不输出到stderr"""
+        """Suppress logging to stderr"""
         pass
 
     def do_CONNECT(self):
-        """处理HTTPS CONNECT请求"""
+        """Handle HTTPS CONNECT requests"""
         self.send_error(405, "Method Not Allowed")
 
     def do_GET(self):
@@ -64,41 +64,41 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
         self._handle_request()
 
     def _handle_request(self):
-        """处理所有HTTP请求"""
+        """Handle all HTTP requests"""
         try:
-            # 读取请求体
+            # Read request body
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length) if content_length > 0 else None
 
-            # 连接后端（SSH隧道）
+            # Connect to backend (SSH tunnel)
             backend_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             backend_socket.settimeout(30)
             backend_socket.connect(('127.0.0.1', self.backend_port))
 
-            # 构建转发请求，使用正确的Host头
+            # Build forwarding request with correct Host header
             request_line = f"{self.command} {self.path} HTTP/1.1\r\n"
 
-            # 构建请求头，确保Host是远端服务器的域名
+            # Build headers, ensure Host is set to remote server's domain
             headers = []
             for key, value in self.headers.items():
                 if key.lower() == 'host':
-                    # 替换为远端服务器的Host
+                    # Replace with remote server's Host
                     headers.append(f"Host: {self.remote_host}\r\n")
                 else:
                     headers.append(f"{key}: {value}\r\n")
 
-            # 如果没有Host头，添加一个
+            # Add Host header if not present
             if not any(k.lower() == 'host' for k in self.headers.keys()):
                 headers.append(f"Host: {self.remote_host}\r\n")
 
-            # 发送请求
+            # Send request
             request_data = request_line + ''.join(headers) + "\r\n"
             backend_socket.sendall(request_data.encode('utf-8'))
 
             if body:
                 backend_socket.sendall(body)
 
-            # 读取响应并转发
+            # Read response and forward
             response = b''
             while True:
                 try:
@@ -106,15 +106,15 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                     if not chunk:
                         break
                     response += chunk
-                    # 尝试解析响应头，判断是否结束
+                    # Try to parse response headers to determine if complete
                     if b'\r\n\r\n' in response:
-                        # 检查Content-Length
+                        # Check Content-Length
                         header_end = response.index(b'\r\n\r\n')
                         header_part = response[:header_end].decode('utf-8', errors='ignore')
 
-                        # 对于chunked编码或无Content-Length的响应，持续读取直到连接关闭
+                        # For chunked encoding or responses without Content-Length, read until connection closes
                         if 'Transfer-Encoding: chunked' in header_part:
-                            # 继续读取直到收到0\r\n\r\n
+                            # Continue reading until we receive 0\r\n\r\n
                             while True:
                                 chunk = backend_socket.recv(8192)
                                 if not chunk:
@@ -124,7 +124,7 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                                     break
                             break
                         elif 'Content-Length:' in header_part:
-                            # 解析Content-Length
+                            # Parse Content-Length
                             for line in header_part.split('\r\n'):
                                 if line.lower().startswith('content-length:'):
                                     content_length = int(line.split(':')[1].strip())
@@ -137,7 +137,7 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
                                     break
                             break
                         else:
-                            # 无Content-Length，读取到连接关闭
+                            # No Content-Length, read until connection closes
                             while True:
                                 chunk = backend_socket.recv(8192)
                                 if not chunk:
@@ -149,15 +149,15 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
 
             backend_socket.close()
 
-            # 发送响应给客户端
+            # Send response to client
             self.connection.sendall(response)
 
         except Exception as e:
-            print(f"  ✗ 代理请求失败: {e}")
+            print(f"  X Proxy request failed: {e}")
             self.send_error(502, f"Bad Gateway: {e}")
 
     def handle_one_request(self):
-        """重写以处理连接关闭的情况"""
+        """Override to handle connection close gracefully"""
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if len(self.raw_requestline) > 65536:
@@ -190,13 +190,13 @@ class ProxyHTTPHandler(BaseHTTPRequestHandler):
 
 
 class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    """多线程HTTP服务器"""
+    """Multi-threaded HTTP server"""
     allow_reuse_address = True
     daemon_threads = True
 
 
 class SSHProxyManager:
-    """SSH代理管理器"""
+    """SSH Proxy Manager"""
 
     def __init__(self, config_path, exclude_services, use_http_proxy=True):
         self.config_path = config_path
@@ -206,16 +206,16 @@ class SSHProxyManager:
         self.processes = {}  # service_name -> subprocess.Popen
         self.http_servers = {}  # service_name -> HTTPServer
         self.shutdown_requested = False
-        self.force_exit = False  # 第二次信号时强制退出
-        # 创建 Jinja2 Environment 一次，复用
+        self.force_exit = False
+        # Create Jinja2 Environment once for reuse
         self._jinja_env = Environment(loader=BaseLoader(), undefined=StrictUndefined)
 
     def _render_template(self, value, env_vars):
-        """渲染 Jinja2 模板，支持变量引用"""
+        """Render Jinja2 template, supporting variable references"""
         if not isinstance(value, str):
             return value
 
-        # 快速检查：如果字符串不包含模板标记，直接返回
+        # Quick check: if string doesn't contain template markers, return as-is
         if TEMPLATE_MARKERS[0] not in value or TEMPLATE_MARKERS[1] not in value:
             return value
 
@@ -223,19 +223,19 @@ class SSHProxyManager:
             template = self._jinja_env.from_string(value)
             return template.render(env=env_vars)
         except Exception as e:
-            print(f"警告: 模板渲染失败 '{value}': {e}")
+            print(f"Warning: Template rendering failed for '{value}': {e}")
             return value
 
     def _render_config_templates(self, config):
-        """递归渲染配置中的所有模板"""
-        # 使用 get 提取 env 变量定义，不破坏原始配置
+        """Recursively render all templates in config"""
+        # Extract env variables without modifying original config
         env_vars = config.get('env', {})
         return self._render_value(config, env_vars)
 
     def _render_value(self, value, env_vars):
-        """递归渲染单个值"""
+        """Recursively render a single value"""
         if isinstance(value, dict):
-            # 跳过 'env' 键，它不需要渲染
+            # Skip 'env' key, it doesn't need rendering
             return {k: self._render_value(v, env_vars) for k, v in value.items() if k != 'env'}
         elif isinstance(value, list):
             return [self._render_value(item, env_vars) for item in value]
@@ -245,39 +245,39 @@ class SSHProxyManager:
             return value
 
     def load_config(self):
-        """加载配置文件"""
+        """Load configuration file"""
         config_path = Path(self.config_path).expanduser()
         if not config_path.exists():
-            print(f"错误: 配置文件不存在: {config_path}")
+            print(f"Error: Config file not found: {config_path}")
             sys.exit(1)
 
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
 
-        # 渲染配置中的模板
+        # Render templates in config
         self.config = self._render_config_templates(self.config)
 
-        # 验证配置
+        # Validate config
         if 'remote_server' not in self.config:
-            print("错误: 配置文件缺少 remote_server 配置")
+            print("Error: Config missing 'remote_server' section")
             sys.exit(1)
         if 'services' not in self.config:
-            print("错误: 配置文件缺少 services 配置")
+            print("Error: Config missing 'services' section")
             sys.exit(1)
 
         remote_server = self.config['remote_server']
         if 'host' not in remote_server or 'ssh_name' not in remote_server:
-            print("错误: remote_server 配置缺少 host 或 ssh_name")
+            print("Error: remote_server config missing 'host' or 'ssh_name'")
             sys.exit(1)
 
     def get_services_to_proxy(self):
-        """获取需要代理的服务列表"""
+        """Get list of services to proxy"""
         all_services = set(self.config['services'].keys())
         services_to_proxy = all_services - self.exclude_services
         return services_to_proxy
 
     def _get_service_connection_info(self, service_config):
-        """获取服务的连接信息，统一处理默认值逻辑"""
+        """Get service connection info with default value handling"""
         remote_server = self.config['remote_server']
         remote_host = service_config.get('host', remote_server['host'])
         remote_port = service_config.get('remote_port', DEFAULT_REMOTE_PORT)
@@ -285,7 +285,7 @@ class SSHProxyManager:
         return remote_host, remote_port, local_port
 
     def _find_available_port(self, start_port=20000, max_attempts=100):
-        """查找可用端口"""
+        """Find an available port"""
         for port in range(start_port, start_port + max_attempts):
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -293,10 +293,10 @@ class SSHProxyManager:
                     return port
             except OSError:
                 continue
-        raise RuntimeError("无法找到可用端口")
+        raise RuntimeError("Could not find an available port")
 
     def build_ssh_command(self, service_name, service_config, ssh_tunnel_port):
-        """构造SSH命令"""
+        """Build SSH command"""
         remote_server = self.config['remote_server']
         ssh_name = remote_server['ssh_name']
 
@@ -306,17 +306,17 @@ class SSHProxyManager:
         return cmd, ssh_tunnel_port
 
     def start_proxy(self, service_name, service_config):
-        """启动单个代理（SSH隧道 + 可选的HTTP代理）"""
+        """Start a single proxy (SSH tunnel + optional HTTP proxy)"""
         remote_host, remote_port, local_port = self._get_service_connection_info(service_config)
 
         if self.use_http_proxy:
-            # 模式：本地HTTP代理 -> SSH隧道(随机端口) -> 远端
-            # SSH隧道使用随机端口
+            # Mode: Local HTTP proxy -> SSH tunnel (random port) -> Remote
+            # SSH tunnel uses a random port
             ssh_tunnel_port = self._find_available_port()
             cmd, _ = self.build_ssh_command(service_name, service_config, ssh_tunnel_port)
 
             try:
-                # 启动SSH隧道
+                # Start SSH tunnel
                 process = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -324,10 +324,10 @@ class SSHProxyManager:
                     text=True
                 )
 
-                # 等待SSH隧道建立
+                # Wait for SSH tunnel to establish
                 time.sleep(0.2)
 
-                # 创建HTTP代理，转发到SSH隧道
+                # Create HTTP proxy that forwards to SSH tunnel
                 handler = type('ProxyHandler', (ProxyHTTPHandler,), {
                     'remote_host': remote_host,
                     'backend_port': ssh_tunnel_port
@@ -338,10 +338,10 @@ class SSHProxyManager:
 
                 return process, server
             except Exception as e:
-                print(f"✗ 启动失败: {service_name} - {e}")
+                print(f"X Failed to start: {service_name} - {e}")
                 return None, None
         else:
-            # 传统模式：直接SSH隧道
+            # Legacy mode: Direct SSH tunnel
             remote_server = self.config['remote_server']
             ssh_name = remote_server['ssh_name']
             cmd = ['ssh', '-N', '-L', f'{local_port}:{remote_host}:{remote_port}', ssh_name]
@@ -355,28 +355,28 @@ class SSHProxyManager:
                 )
                 return process, None
             except Exception as e:
-                print(f"✗ 启动失败: {service_name} - {e}")
+                print(f"X Failed to start: {service_name} - {e}")
                 return None, None
 
     def start_all_proxies(self):
-        """启动所有代理"""
+        """Start all proxies"""
         services_to_proxy = self.get_services_to_proxy()
 
-        mode_str = "HTTP代理模式" if self.use_http_proxy else "直接隧道模式"
-        print(f"[ssh-proxy] 正在启动代理 ({mode_str})...")
+        mode_str = "HTTP proxy mode" if self.use_http_proxy else "Direct tunnel mode"
+        print(f"[ssh-proxy] Starting proxies ({mode_str})...")
         if self.exclude_services:
-            print(f"[ssh-proxy] 排除的服务: {', '.join(sorted(self.exclude_services))}")
-        print(f"[ssh-proxy] 将代理 {len(services_to_proxy)} 个服务\n")
+            print(f"[ssh-proxy] Excluded services: {', '.join(sorted(self.exclude_services))}")
+        print(f"[ssh-proxy] Will proxy {len(services_to_proxy)} services\n")
 
-        # 先显示将要启动的服务
+        # Show services to be started
         for service_name in sorted(services_to_proxy):
             service_config = self.config['services'][service_name]
             remote_host, remote_port, local_port = self._get_service_connection_info(service_config)
-            print(f"[{service_name}] → localhost:{local_port} -> {remote_host}:{remote_port}")
+            print(f"[{service_name}] -> localhost:{local_port} -> {remote_host}:{remote_port}")
 
         print()
 
-        # 启动所有SSH进程
+        # Start all SSH processes
         startup_delay = self.config.get('options', {}).get('startup_delay', 0.5)
 
         for service_name in sorted(services_to_proxy):
@@ -387,7 +387,7 @@ class SSHProxyManager:
             process, http_server = self.start_proxy(service_name, service_config)
 
             if process is None:
-                print(f"✗ 启动失败: {service_name}")
+                print(f"X Failed to start: {service_name}")
                 self.stop_all_proxies()
                 sys.exit(1)
 
@@ -395,56 +395,56 @@ class SSHProxyManager:
             if http_server:
                 self.http_servers[service_name] = http_server
 
-            # 短暂延迟
+            # Brief delay
             time.sleep(startup_delay)
 
-        # 验证所有进程是否正常运行
+        # Verify all processes are running
         failed_services = []
         for service_name, process in self.processes.items():
             if process.poll() is not None:
-                # 进程已退出
+                # Process has exited
                 failed_services.append(service_name)
 
         if failed_services:
-            print(f"\n✗ 启动失败: {', '.join(failed_services)}")
-            print("→ 正在回滚已启动的代理...")
+            print(f"\nX Failed to start: {', '.join(failed_services)}")
+            print("-> Rolling back started proxies...")
             self.stop_all_proxies()
             sys.exit(1)
 
-        print("\n[ssh-proxy] ✓ 所有代理已启动，按 Ctrl+C 停止\n")
+        print("\n[ssh-proxy] All proxies started. Press Ctrl+C to stop.\n")
 
     def stop_all_proxies(self):
-        """停止所有代理"""
-        # 先停止HTTP服务器
+        """Stop all proxies"""
+        # Stop HTTP servers first
         for service_name, server in self.http_servers.items():
             try:
                 server.shutdown()
-                print(f"✓ 已停止HTTP代理: {service_name}")
+                print(f"+ Stopped HTTP proxy: {service_name}")
             except Exception as e:
-                print(f"✗ 停止HTTP代理失败: {service_name} - {e}")
+                print(f"X Failed to stop HTTP proxy: {service_name} - {e}")
         self.http_servers.clear()
 
-        # 再停止SSH进程
+        # Then stop SSH processes
         for service_name, process in self.processes.items():
-            if process.poll() is None:  # 进程仍在运行
+            if process.poll() is None:  # Process still running
                 process.terminate()
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.wait()
-                print(f"✓ 已停止SSH隧道: {service_name}")
+                print(f"+ Stopped SSH tunnel: {service_name}")
         self.processes.clear()
 
     def wait_for_shutdown(self):
-        """等待 shutdown 信号"""
+        """Wait for shutdown signal"""
         try:
-            # 等待任一进程退出
+            # Wait for any process to exit
             while not self.shutdown_requested:
-                # 检查是否有进程意外退出
+                # Check if any process exited unexpectedly
                 for service_name, process in list(self.processes.items()):
                     if process.poll() is not None:
-                        print(f"\n[{service_name}] 进程意外退出")
+                        print(f"\n[{service_name}] Process exited unexpectedly")
                         self.shutdown_requested = True
                         break
 
@@ -457,69 +457,69 @@ class SSHProxyManager:
             pass
         finally:
             if self.force_exit:
-                print("\n[ssh-proxy] 强制退出！")
+                print("\n[ssh-proxy] Force exit!")
                 sys.exit(1)
-            print("\n[ssh-proxy] 正在停止所有代理...")
+            print("\n[ssh-proxy] Stopping all proxies...")
             self.stop_all_proxies()
 
     def run(self):
-        """运行代理管理器"""
+        """Run the proxy manager"""
         self.load_config()
         self.start_all_proxies()
         self.wait_for_shutdown()
 
 
-# 全局变量，用于信号处理
+# Global variable for signal handling
 _manager = None
 
 
 def signal_handler(signum, frame):
-    """信号处理器"""
+    """Signal handler"""
     global _manager
     if _manager is None:
         return
 
     if _manager.shutdown_requested:
-        # 第二次信号，强制退出
+        # Second signal, force exit
         _manager.force_exit = True
         _manager.shutdown_requested = True
     else:
-        # 第一次信号，体面终止
-        print(f"\n[ssh-proxy] 收到信号 {signum}，正在停止... (再次发送信号将强制退出)")
+        # First signal, graceful shutdown
+        print(f"\n[ssh-proxy] Received signal {signum}, stopping... (send again to force exit)")
         _manager.shutdown_requested = True
 
 
 def main():
     global _manager
     parser = argparse.ArgumentParser(
-        description='SSH代理管理脚本 - 将远端服务代理到本地',
+        description='SSH Proxy Manager - Proxy remote services to localhost',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
         '--config', '-c',
         default='./config.yaml',
-        help='配置文件路径 (默认: ./config.yaml)'
+        help='Config file path (default: ./config.yaml)'
     )
     parser.add_argument(
         '--exclude', '-e',
         nargs='*',
         default=[],
         metavar='SERVICE',
-        help='要排除的服务名称（将代理除这些服务外的所有服务）'
+        help='Services to exclude (proxy all services except these)'
     )
     parser.add_argument(
         '--no-http-proxy',
         action='store_true',
-        help='禁用HTTP代理模式，使用直接SSH隧道（Host头不会被修改）'
+        help='Disable HTTP proxy mode, use direct SSH tunnel (Host header will not be modified)'
     )
 
     args = parser.parse_args()
 
-    # 设置信号处理
+    # Setup signal handlers
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 创建并运行管理器
+    # Create and run manager
     use_http_proxy = not args.no_http_proxy
     _manager = SSHProxyManager(args.config, args.exclude, use_http_proxy)
     _manager.run()
