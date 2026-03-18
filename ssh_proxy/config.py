@@ -74,10 +74,12 @@ class ConfigLoader:
         if 'remote_server' not in self.config:
             print("Error: Config missing 'remote_server' section")
             sys.exit(1)
+
         if 'services' not in self.config:
             print("Error: Config missing 'services' section")
             sys.exit(1)
 
+        # Validate remote_server fields
         remote_server = self.config['remote_server']
         if 'host' not in remote_server or 'ssh_name' not in remote_server:
             print("Error: remote_server config missing 'host' or 'ssh_name'")

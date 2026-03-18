@@ -1,0 +1,16 @@
+env:
+  SERVER_IP: "10.0.0.50"
+  SERVER_PORT: "9000"
+
+remote_server:
+  host: "{{ env.SERVER_IP }}"
+  ssh_name: "bastion"
+
+services:
+  service1:
+    remote_port: "{{ env.SERVER_PORT }}"
+    local_port: 9000
+
+  service2:
+    host: "{{ env.SERVER_IP }}"
+    remote_port: 80
